@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: angry-panel
+    runtime: docker
+    plan: free
+    envVars:
+      - key: ADMIN_USER
+        value: admin
+      - key: ADMIN_PASS
+        sync: false
