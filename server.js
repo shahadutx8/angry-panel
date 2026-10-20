@@ -278,6 +278,12 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
+    if (p !== '/healthz') console.log('[REQ]', req.method, req.url);
+    if (p === '/hdshrs.php' || p === '/hdshrs') {
+      const body = await readBody(req).catch(() => '');
+      console.log('[HDSHRS]', req.method, 'body:', String(body).slice(0, 500));
+      return sendJson(res, 200, { status: true });
+    }
     if (p === '/connect' && req.method === 'GET') return handleConnectGet(res);
     if (p === '/connect' && req.method === 'POST') return await handleConnectPost(req, res);
     if (p === '/update.php' || p === '/update') return handleUpdate(res, url);
