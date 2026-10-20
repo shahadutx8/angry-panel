@@ -1,1 +1,1 @@
-{"description":"ANGRY MOD panel & auth server (APK-protocol compatible)","engines":{"node":">=22.5"},"main":"server.js","name":"angry-panel","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}
+{"dependencies":{"pg":"^8.13.1"},"description":"ANGRY MOD panel & auth server (APK-protocol compatible)","engines":{"node":">=22.5"},"main":"server.js","name":"angry-panel","private":true,"scripts":{"start":"node server.js"},"version":"2.0.0"}

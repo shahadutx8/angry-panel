@@ -13,58 +13,131 @@
  *   GET  /apkhash.php -> plain-text MD5 hash of the official APK
  *
  * Admin panel: /login -> /dashboard (keys, settings, login logs)
- * No external dependencies: node:http + node:sqlite only (Node >= 22.5).
+ *
+ * Storage: Postgres when DATABASE_URL is set (persistent — survives
+ * restarts/redeploys), otherwise local SQLite file (dev fallback).
+ * Keys support max_devices: 1 = single device (default), 0 = UNLIMITED.
  */
 const http = require('node:http');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
 
 const PORT = process.env.PORT || 8080;
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new DatabaseSync(path.join(DATA_DIR, 'panel.db'));
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const USE_PG = !!DATABASE_URL;
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS keys (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_key TEXT UNIQUE NOT NULL,
-  label TEXT DEFAULT '',
-  seller_name TEXT DEFAULT 'ANGRY MOD',
-  registrator TEXT DEFAULT 'Admin',
-  expired_date TEXT NOT NULL,
-  serial TEXT,
-  status TEXT DEFAULT 'active',       -- active | banned | crash
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT DEFAULT (datetime('now')),
-  user_key TEXT, serial TEXT, ip TEXT, result TEXT, reason TEXT
-);
-CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT);
-`);
+/* ---------------- storage layer (pg or sqlite, same API) ---------------- */
+let dbRun, dbGet, dbAll, dbKind;
+if (USE_PG) {
+  const { Pool } = require('pg');
+  const pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: /neon\.tech|render\.com/.test(DATABASE_URL) ? { rejectUnauthorized: false } : undefined,
+    max: 5,
+  });
+  const conv = (sql) => { let i = 0; return sql.replace(/\?/g, () => '$' + (++i)); };
+  dbKind = 'postgres';
+  dbRun = async (sql, ...p) => { await pool.query(conv(sql), p); };
+  dbGet = async (sql, ...p) => { const r = await pool.query(conv(sql), p); return r.rows[0]; };
+  dbAll = async (sql, ...p) => { const r = await pool.query(conv(sql), p); return r.rows; };
+} else {
+  const { DatabaseSync } = require('node:sqlite');
+  const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const sq = new DatabaseSync(path.join(DATA_DIR, 'panel.db'));
+  dbKind = 'sqlite';
+  dbRun = async (sql, ...p) => { sq.prepare(sql).run(...p); };
+  dbGet = async (sql, ...p) => sq.prepare(sql).get(...p);
+  dbAll = async (sql, ...p) => sq.prepare(sql).all(...p);
+}
 
-function getSetting(k, dflt) {
-  const r = db.prepare('SELECT v FROM settings WHERE k=?').get(k);
-  return r ? r.v : dflt;
+const nowSql = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+async function initDb() {
+  if (USE_PG) {
+    await dbRun(`CREATE TABLE IF NOT EXISTS keys (
+      id SERIAL PRIMARY KEY,
+      user_key TEXT UNIQUE NOT NULL,
+      label TEXT DEFAULT '',
+      seller_name TEXT DEFAULT 'ANGRY MOD',
+      registrator TEXT DEFAULT 'Admin',
+      expired_date TEXT NOT NULL,
+      serial TEXT,
+      max_devices INTEGER DEFAULT 1,
+      status TEXT DEFAULT 'active',
+      created_at TEXT DEFAULT '')`);
+    await dbRun(`CREATE TABLE IF NOT EXISTS key_devices (
+      id SERIAL PRIMARY KEY,
+      key_id INTEGER NOT NULL,
+      serial TEXT NOT NULL,
+      first_seen TEXT DEFAULT '',
+      UNIQUE(key_id, serial))`);
+    await dbRun(`CREATE TABLE IF NOT EXISTS logs (
+      id SERIAL PRIMARY KEY,
+      ts TEXT DEFAULT '',
+      user_key TEXT, serial TEXT, ip TEXT, result TEXT, reason TEXT)`);
+    await dbRun(`CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)`);
+    await dbRun(`ALTER TABLE keys ADD COLUMN IF NOT EXISTS max_devices INTEGER DEFAULT 1`);
+  } else {
+    await dbRun(`CREATE TABLE IF NOT EXISTS keys (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_key TEXT UNIQUE NOT NULL,
+      label TEXT DEFAULT '',
+      seller_name TEXT DEFAULT 'ANGRY MOD',
+      registrator TEXT DEFAULT 'Admin',
+      expired_date TEXT NOT NULL,
+      serial TEXT,
+      max_devices INTEGER DEFAULT 1,
+      status TEXT DEFAULT 'active',
+      created_at TEXT DEFAULT '')`);
+    await dbRun(`CREATE TABLE IF NOT EXISTS key_devices (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key_id INTEGER NOT NULL,
+      serial TEXT NOT NULL,
+      first_seen TEXT DEFAULT '',
+      UNIQUE(key_id, serial))`);
+    await dbRun(`CREATE TABLE IF NOT EXISTS logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT DEFAULT '',
+      user_key TEXT, serial TEXT, ip TEXT, result TEXT, reason TEXT)`);
+    await dbRun(`CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)`);
+    const cols = await dbAll(`PRAGMA table_info(keys)`);
+    if (!cols.some((c) => c.name === 'max_devices')) {
+      await dbRun(`ALTER TABLE keys ADD COLUMN max_devices INTEGER DEFAULT 1`);
+    }
+  }
+  // Migrate any legacy single-serial binding into key_devices
+  const legacy = await dbAll(`SELECT id, serial FROM keys WHERE serial IS NOT NULL AND serial<>''`);
+  for (const k of legacy) {
+    const has = await dbGet(`SELECT id FROM key_devices WHERE key_id=? AND serial=?`, k.id, k.serial);
+    if (!has) await dbRun(`INSERT INTO key_devices(key_id,serial,first_seen) VALUES(?,?,?)`, k.id, k.serial, nowSql()).catch(() => {});
+  }
+  // Seed defaults (only when empty)
+  if (!(await getSetting('apk_md5'))) await setSetting('apk_md5', 'becb3c8f75961ed77368896e9325ece4'); // MD5 of ANGRY_MOD_V3 as uploaded 2026-10-20
+  if (!(await getSetting('latest_version'))) await setSetting('latest_version', '3.0');
+  if (!(await getSetting('latest_version_code'))) await setSetting('latest_version_code', '1');
+  if (!(await getSetting('update_url'))) await setSetting('update_url', '');
+  if (!(await getSetting('update_message'))) await setSetting('update_message', '');
+  if (!(await getSetting('client_name'))) await setSetting('client_name', 'ANGRY MOD');
+  if (!(await getSetting('panel_license'))) await setSetting('panel_license', crypto.randomBytes(16).toString('hex'));
+  if (!(await getSetting('dev_author'))) await setSetting('dev_author', '@engpinxt');
+  if (!(await getSetting('dev_telegram'))) await setSetting('dev_telegram', 'https://t.me/angrymodofficials');
+  if (!(await getSetting('crash_all'))) await setSetting('crash_all', '0');
+  if (!(await getSetting('crash_message'))) await setSetting('crash_message', 'Server is under maintenance');
 }
-function setSetting(k, v) {
-  db.prepare('INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k, String(v));
+
+async function getSetting(k) {
+  const r = await dbGet('SELECT v FROM settings WHERE k=?', k);
+  return r ? r.v : null;
 }
-// Seed defaults (only when empty)
-if (!getSetting('apk_md5')) setSetting('apk_md5', 'becb3c8f75961ed77368896e9325ece4'); // MD5 of ANGRY_MOD_V3 as uploaded 2026-10-20
-if (!getSetting('latest_version')) setSetting('latest_version', '3.0');
-if (!getSetting('latest_version_code')) setSetting('latest_version_code', '1');
-if (!getSetting('update_url')) setSetting('update_url', '');
-if (!getSetting('update_message')) setSetting('update_message', '');
-if (!getSetting('client_name')) setSetting('client_name', 'ANGRY MOD');
-if (!getSetting('panel_license')) setSetting('panel_license', crypto.randomBytes(16).toString('hex'));
-if (!getSetting('dev_author')) setSetting('dev_author', '@engpinxt');
-if (!getSetting('dev_telegram')) setSetting('dev_telegram', 'https://t.me/angrymodofficials');
-if (!getSetting('crash_all')) setSetting('crash_all', '0');
-if (!getSetting('crash_message')) setSetting('crash_message', 'Server is under maintenance');
+async function setSetting(k, v) {
+  await dbRun('INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v', k, String(v));
+}
+async function listDevices(keyId) {
+  const rows = await dbAll('SELECT serial FROM key_devices WHERE key_id=? ORDER BY id', keyId);
+  return rows.map((r) => r.serial);
+}
 
 /* ---------------- admin auth ---------------- */
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
@@ -119,23 +192,23 @@ function genKey() {
   const seg = (n) => Array.from(crypto.randomBytes(n)).map((b) => chars[b % chars.length]).join('');
   return 'ANGRY-' + seg(4) + '-' + seg(4) + '-' + seg(4);
 }
-function logAttempt(req, f, result, reason) {
+async function logAttempt(req, f, result, reason) {
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-  db.prepare('INSERT INTO logs(user_key,serial,ip,result,reason) VALUES(?,?,?,?,?)')
-    .run(f.user_key || '', f.serial || '', ip, result, reason || '');
+  await dbRun('INSERT INTO logs(ts,user_key,serial,ip,result,reason) VALUES(?,?,?,?,?,?)',
+    nowSql(), f.user_key || '', f.serial || '', ip, result, reason || '').catch(() => {});
 }
 
 /* ---------------- APK protocol ---------------- */
-function handleConnectGet(res) {
+async function handleConnectGet(res) {
   sendJson(res, 200, {
     web_info: {
-      _client: getSetting('client_name'),
-      license: getSetting('panel_license'),
+      _client: await getSetting('client_name'),
+      license: await getSetting('panel_license'),
       version: '1.0.0',
     },
     web__dev: {
-      author: getSetting('dev_author'),
-      telegram: getSetting('dev_telegram'),
+      author: await getSetting('dev_author'),
+      telegram: await getSetting('dev_telegram'),
     },
   });
 }
@@ -146,40 +219,44 @@ async function handleConnectPost(req, res) {
   const userKey = String(f.user_key || '').trim();
   const serial = String(f.serial || '').trim();
 
-  if (getSetting('crash_all') === '1') {
-    logAttempt(req, f, 'crash', 'crash_all');
-    return sendJson(res, 200, { status: false, crash: true, reason: getSetting('crash_message') });
+  if ((await getSetting('crash_all')) === '1') {
+    await logAttempt(req, f, 'crash', 'crash_all');
+    return sendJson(res, 200, { status: false, crash: true, reason: await getSetting('crash_message') });
   }
   if (!userKey) {
-    logAttempt(req, f, 'fail', 'User key required');
+    await logAttempt(req, f, 'fail', 'User key required');
     return sendJson(res, 200, { status: false, reason: 'User key required' });
   }
-  const row = db.prepare('SELECT * FROM keys WHERE user_key=?').get(userKey);
+  const row = await dbGet('SELECT * FROM keys WHERE user_key=?', userKey);
   if (!row) {
-    logAttempt(req, f, 'fail', 'Invalid user key');
+    await logAttempt(req, f, 'fail', 'Invalid user key');
     return sendJson(res, 200, { status: false, reason: 'Invalid user key' });
   }
   if (row.status === 'banned') {
-    logAttempt(req, f, 'fail', 'Key banned');
+    await logAttempt(req, f, 'fail', 'Key banned');
     return sendJson(res, 200, { status: false, reason: 'This key is banned. Contact your seller.' });
   }
   if (row.status === 'crash') {
-    logAttempt(req, f, 'crash', 'Key crash flag');
+    await logAttempt(req, f, 'crash', 'Key crash flag');
     return sendJson(res, 200, { status: false, crash: true, reason: 'This key has been disabled by admin.' });
   }
   if (new Date(row.expired_date.replace(' ', 'T')) < new Date()) {
-    logAttempt(req, f, 'fail', 'Key expired');
+    await logAttempt(req, f, 'fail', 'Key expired');
     return sendJson(res, 200, { status: false, reason: 'Your key has expired. Contact your seller.' });
   }
   if (serial) {
-    if (!row.serial) {
-      db.prepare('UPDATE keys SET serial=? WHERE id=?').run(serial, row.id);
-    } else if (row.serial !== serial) {
-      logAttempt(req, f, 'fail', 'Serial mismatch');
-      return sendJson(res, 200, { status: false, reason: 'Serial not matched. This key is used on another device.' });
+    const maxDev = (row.max_devices == null ? 1 : row.max_devices); // 0 = unlimited
+    const devices = await listDevices(row.id);
+    if (!devices.includes(serial)) {
+      if (maxDev !== 0 && devices.length >= maxDev) {
+        await logAttempt(req, f, 'fail', 'Device limit reached');
+        return sendJson(res, 200, { status: false, reason: 'Device limit reached. This key is already used on the maximum number of devices.' });
+      }
+      await dbRun('INSERT INTO key_devices(key_id,serial,first_seen) VALUES(?,?,?)', row.id, serial, nowSql()).catch(() => {});
+      if (!row.serial) await dbRun('UPDATE keys SET serial=? WHERE id=?', serial, row.id).catch(() => {});
     }
   }
-  logAttempt(req, f, 'success', '');
+  await logAttempt(req, f, 'success', '');
   return sendJson(res, 200, {
     status: true,
     data: {
@@ -191,9 +268,9 @@ async function handleConnectPost(req, res) {
   });
 }
 
-function handleUpdate(res, url) {
-  const latest = getSetting('latest_version');
-  const latestCode = parseInt(getSetting('latest_version_code'), 10) || 1;
+async function handleUpdate(res, url) {
+  const latest = await getSetting('latest_version');
+  const latestCode = parseInt(await getSetting('latest_version_code'), 10) || 1;
   const clientCode = parseInt(url.searchParams.get('version_code') || url.searchParams.get('code') || '0', 10) || 0;
   const updateAvailable = clientCode > 0 ? clientCode < latestCode : false;
   sendJson(res, 200, {
@@ -201,9 +278,9 @@ function handleUpdate(res, url) {
     version: latest,
     version_code: latestCode,
     update_available: updateAvailable,
-    url: updateAvailable ? getSetting('update_url') : '',
+    url: updateAvailable ? await getSetting('update_url') : '',
     message: updateAvailable
-      ? (getSetting('update_message') || 'A new version is available. Please update.')
+      ? ((await getSetting('update_message')) || 'A new version is available. Please update.')
       : 'You are using the latest version',
   });
 }
@@ -229,21 +306,30 @@ function loginPage(err) {
   </form>`);
 }
 
-function dashboardPage() {
-  const keys = db.prepare('SELECT * FROM keys ORDER BY id DESC').all();
-  const logs = db.prepare('SELECT * FROM logs ORDER BY id DESC LIMIT 50').all();
-  const rows = keys.map((k) => `<tr><td>${k.id}</td><td><b>${esc(k.user_key)}</b><br><span class="small">${esc(k.label)}</span></td>
-    <td>${esc(k.expired_date)}</td><td>${esc(k.serial || '-')}</td>
+async function dashboardPage() {
+  const keys = await dbAll('SELECT * FROM keys ORDER BY id DESC');
+  const logs = await dbAll('SELECT * FROM logs ORDER BY id DESC LIMIT 50');
+  const rows = [];
+  for (const k of keys) {
+    const devices = await listDevices(k.id);
+    const maxDev = (k.max_devices == null ? 1 : k.max_devices);
+    const devText = maxDev === 0 ? devices.length + ' / Unlimited' : devices.length + ' / ' + maxDev;
+    const devList = devices.length ? '<br><span class="small">' + devices.map(esc).join('<br>') + '</span>' : '';
+    rows.push(`<tr><td>${k.id}</td><td><b>${esc(k.user_key)}</b><br><span class="small">${esc(k.label)}</span></td>
+    <td>${esc(k.expired_date)}</td><td>${devText}${devList}</td>
     <td class="${k.status === 'active' ? 'ok' : 'bad'}">${esc(k.status)}</td>
     <td>${esc(k.seller_name)} / ${esc(k.registrator)}</td>
     <td>
       <form method="post" action="/api/keys/${k.id}/action" style="display:inline">
-        <select name="act"><option value="unbind">Unbind serial</option><option value="ban">Ban</option>
+        <select name="act"><option value="unbind">Unbind devices</option><option value="ban">Ban</option>
         <option value="unban">Unban</option><option value="crash">Crash</option><option value="delete">Delete</option></select>
         <button class="gray">Go</button></form>
-    </td></tr>`).join('');
+    </td></tr>`);
+  }
   const logRows = logs.map((l) => `<tr><td>${esc(l.ts)}</td><td>${esc(l.user_key)}</td><td>${esc(l.serial)}</td>
     <td>${esc(l.ip)}</td><td class="${l.result === 'success' ? 'ok' : 'bad'}">${esc(l.result)}</td><td>${esc(l.reason)}</td></tr>`).join('');
+  const s = {};
+  for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message']) s[k] = await getSetting(k);
   return page('ANGRY MOD - Dashboard', `<h1>ANGRY MOD - Dashboard</h1>
   <p><a href="/logout">Logout</a></p>
   <div class="card"><h2>Create key</h2>
@@ -251,24 +337,25 @@ function dashboardPage() {
       <input name="user_key" placeholder="Custom key (blank = auto-generate)">
       <input name="label" placeholder="Label / buyer name">
       <input name="days" type="number" value="30" min="1" style="width:90px"> days
+      <select name="max_devices"><option value="1">1 device</option><option value="2">2 devices</option><option value="3">3 devices</option><option value="5">5 devices</option><option value="10">10 devices</option><option value="0">Unlimited devices</option></select>
       <input name="seller_name" placeholder="Seller name" value="ANGRY MOD">
       <input name="registrator" placeholder="Registrator" value="Admin">
       <button>Create</button>
     </form></div>
   <div class="card"><h2>Keys (${keys.length})</h2><table>
-    <tr><th>#</th><th>Key</th><th>Expiry</th><th>Serial</th><th>Status</th><th>Seller/By</th><th>Action</th></tr>${rows}</table></div>
+    <tr><th>#</th><th>Key</th><th>Expiry</th><th>Devices</th><th>Status</th><th>Seller/By</th><th>Action</th></tr>${rows.join('')}</table></div>
   <div class="card"><h2>Settings</h2>
     <form method="post" action="/api/settings">
-      <div>Latest version <input name="latest_version" value="${esc(getSetting('latest_version'))}">
-      code <input name="latest_version_code" value="${esc(getSetting('latest_version_code'))}" style="width:70px"></div>
-      <div>Update APK URL <input name="update_url" value="${esc(getSetting('update_url'))}" style="width:70%"></div>
-      <div>Update message <input name="update_message" value="${esc(getSetting('update_message'))}" style="width:70%"></div>
-      <div>Official APK MD5 <input name="apk_md5" value="${esc(getSetting('apk_md5'))}" style="width:300px"></div>
-      <div>Crash ALL users <select name="crash_all"><option value="0"${getSetting('crash_all') === '0' ? ' selected' : ''}>Off</option><option value="1"${getSetting('crash_all') === '1' ? ' selected' : ''}>On</option></select>
-      message <input name="crash_message" value="${esc(getSetting('crash_message'))}"></div>
+      <div>Latest version <input name="latest_version" value="${esc(s.latest_version)}">
+      code <input name="latest_version_code" value="${esc(s.latest_version_code)}" style="width:70px"></div>
+      <div>Update APK URL <input name="update_url" value="${esc(s.update_url)}" style="width:70%"></div>
+      <div>Update message <input name="update_message" value="${esc(s.update_message)}" style="width:70%"></div>
+      <div>Official APK MD5 <input name="apk_md5" value="${esc(s.apk_md5)}" style="width:300px"></div>
+      <div>Crash ALL users <select name="crash_all"><option value="0"${s.crash_all === '0' ? ' selected' : ''}>Off</option><option value="1"${s.crash_all === '1' ? ' selected' : ''}>On</option></select>
+      message <input name="crash_message" value="${esc(s.crash_message)}"></div>
       <button>Save settings</button>
     </form>
-    <p class="small">APK endpoints: POST /connect &nbsp; GET /update.php &nbsp; GET /apkhash.php</p></div>
+    <p class="small">APK endpoints: POST /connect &nbsp; GET /update.php &nbsp; GET /apkhash.php &nbsp; Storage: ${dbKind}</p></div>
   <div class="card"><h2>Login logs (last 50)</h2><table>
     <tr><th>Time</th><th>Key</th><th>Serial</th><th>IP</th><th>Result</th><th>Reason</th></tr>${logRows}</table></div>`);
 }
@@ -284,12 +371,12 @@ const server = http.createServer(async (req, res) => {
       console.log('[HDSHRS]', req.method, 'body:', String(body).slice(0, 500));
       return sendJson(res, 200, { status: true });
     }
-    if (p === '/connect' && req.method === 'GET') return handleConnectGet(res);
+    if (p === '/connect' && req.method === 'GET') return await handleConnectGet(res);
     if (p === '/connect' && req.method === 'POST') return await handleConnectPost(req, res);
-    if (p === '/update.php' || p === '/update') return handleUpdate(res, url);
+    if (p === '/update.php' || p === '/update') return await handleUpdate(res, url);
     if (p === '/apkhash.php' || p === '/apkhash') {
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=UTF-8' });
-      return res.end(getSetting('apk_md5'));
+      return res.end(await getSetting('apk_md5'));
     }
     if (p === '/' || p === '/login') {
       if (isAuthed(req)) { res.writeHead(302, { Location: '/dashboard' }); return res.end(); }
@@ -313,17 +400,19 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/dashboard') {
       if (!isAuthed(req)) { res.writeHead(302, { Location: '/login' }); return res.end(); }
-      return sendHtml(res, 200, dashboardPage());
+      return sendHtml(res, 200, await dashboardPage());
     }
     if (p === '/api/keys' && req.method === 'POST') {
       if (!isAuthed(req)) return sendJson(res, 401, { error: 'login required' });
       const f = parseFields(req, await readBody(req));
       const key = String(f.user_key || '').trim() || genKey();
       const days = Math.max(1, parseInt(f.days, 10) || 30);
+      const mdParsed = parseInt(f.max_devices, 10);
+      const maxDevices = Number.isNaN(mdParsed) ? 1 : Math.max(0, mdParsed);
       const exp = new Date(Date.now() + days * 864e5).toISOString().slice(0, 19).replace('T', ' ');
       try {
-        db.prepare('INSERT INTO keys(user_key,label,seller_name,registrator,expired_date) VALUES(?,?,?,?,?)')
-          .run(key, f.label || '', f.seller_name || 'ANGRY MOD', f.registrator || 'Admin', exp);
+        await dbRun('INSERT INTO keys(user_key,label,seller_name,registrator,expired_date,max_devices,created_at) VALUES(?,?,?,?,?,?,?)',
+          key, f.label || '', f.seller_name || 'ANGRY MOD', f.registrator || 'Admin', exp, maxDevices, nowSql());
       } catch (e) { return sendHtml(res, 400, page('Error', '<p class="bad">Key already exists</p><p><a href="/dashboard">Back</a></p>')); }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
@@ -332,22 +421,22 @@ const server = http.createServer(async (req, res) => {
       if (!isAuthed(req)) return sendJson(res, 401, { error: 'login required' });
       const f = parseFields(req, await readBody(req));
       const id = parseInt(m[1], 10);
-      if (f.act === 'unbind') db.prepare('UPDATE keys SET serial=NULL WHERE id=?').run(id);
-      else if (f.act === 'ban') db.prepare("UPDATE keys SET status='banned' WHERE id=?").run(id);
-      else if (f.act === 'unban') db.prepare("UPDATE keys SET status='active' WHERE id=?").run(id);
-      else if (f.act === 'crash') db.prepare("UPDATE keys SET status='crash' WHERE id=?").run(id);
-      else if (f.act === 'delete') db.prepare('DELETE FROM keys WHERE id=?').run(id);
+      if (f.act === 'unbind') { await dbRun('DELETE FROM key_devices WHERE key_id=?', id); await dbRun('UPDATE keys SET serial=NULL WHERE id=?', id); }
+      else if (f.act === 'ban') await dbRun("UPDATE keys SET status='banned' WHERE id=?", id);
+      else if (f.act === 'unban') await dbRun("UPDATE keys SET status='active' WHERE id=?", id);
+      else if (f.act === 'crash') await dbRun("UPDATE keys SET status='crash' WHERE id=?", id);
+      else if (f.act === 'delete') { await dbRun('DELETE FROM key_devices WHERE key_id=?', id); await dbRun('DELETE FROM keys WHERE id=?', id); }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
     if (p === '/api/settings' && req.method === 'POST') {
       if (!isAuthed(req)) return sendJson(res, 401, { error: 'login required' });
       const f = parseFields(req, await readBody(req));
       for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message']) {
-        if (f[k] !== undefined) setSetting(k, f[k]);
+        if (f[k] !== undefined) await setSetting(k, f[k]);
       }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
-    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '1.0.0', ok: true });
+    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.0.0', db: dbKind, ok: true });
     res.writeHead(404, { 'Content-Type': 'application/json; charset=UTF-8' });
     res.end(JSON.stringify({ status: false, reason: 'Not found' }));
   } catch (e) {
@@ -356,4 +445,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log('angry-panel listening on port ' + PORT));
+initDb()
+  .then(() => server.listen(PORT, () => console.log('angry-panel v2 listening on port ' + PORT + ' (storage: ' + dbKind + ')')))
+  .catch((e) => { console.error('DB init failed:', e); process.exit(1); });

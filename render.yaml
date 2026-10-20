@@ -8,3 +8,5 @@ services:
         value: admin
       - key: ADMIN_PASS
         sync: false
+      - key: DATABASE_URL
+        sync: false
