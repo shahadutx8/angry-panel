@@ -125,6 +125,7 @@ async function initDb() {
   if (!(await getSetting('dev_telegram'))) await setSetting('dev_telegram', 'https://t.me/angrymodofficials');
   if (!(await getSetting('crash_all'))) await setSetting('crash_all', '0');
   if (!(await getSetting('crash_message'))) await setSetting('crash_message', 'Server is under maintenance');
+  if (!(await getSetting('expired_link'))) await setSetting('expired_link', '');
 }
 
 async function getSetting(k) {
@@ -242,7 +243,11 @@ async function handleConnectPost(req, res) {
   }
   if (new Date(row.expired_date.replace(' ', 'T')) < new Date()) {
     await logAttempt(req, f, 'fail', 'Key expired');
-    return sendJson(res, 200, { status: false, reason: 'Your key has expired. Contact your seller.' });
+    const expLink = (await getSetting('expired_link')) || '';
+    const reason = expLink
+      ? 'Your key has expired. Renew / new key: ' + expLink
+      : 'Your key has expired. Contact your seller.';
+    return sendJson(res, 200, { status: false, reason });
   }
   if (serial) {
     const maxDev = (row.max_devices == null ? 1 : row.max_devices); // 0 = unlimited
@@ -329,7 +334,7 @@ async function dashboardPage() {
   const logRows = logs.map((l) => `<tr><td>${esc(l.ts)}</td><td>${esc(l.user_key)}</td><td>${esc(l.serial)}</td>
     <td>${esc(l.ip)}</td><td class="${l.result === 'success' ? 'ok' : 'bad'}">${esc(l.result)}</td><td>${esc(l.reason)}</td></tr>`).join('');
   const s = {};
-  for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message']) s[k] = await getSetting(k);
+  for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message', 'expired_link']) s[k] = await getSetting(k);
   return page('ANGRY MOD - Dashboard', `<h1>ANGRY MOD - Dashboard</h1>
   <p><a href="/logout">Logout</a></p>
   <div class="card"><h2>Create key</h2>
@@ -350,6 +355,7 @@ async function dashboardPage() {
       code <input name="latest_version_code" value="${esc(s.latest_version_code)}" style="width:70px"></div>
       <div>Update APK URL <input name="update_url" value="${esc(s.update_url)}" style="width:70%"></div>
       <div>Update message <input name="update_message" value="${esc(s.update_message)}" style="width:70%"></div>
+      <div>Expired-key Telegram link <input name="expired_link" value="${esc(s.expired_link)}" style="width:70%" placeholder="https://t.me/yourchannel"></div>
       <div>Official APK MD5 <input name="apk_md5" value="${esc(s.apk_md5)}" style="width:300px"></div>
       <div>Crash ALL users <select name="crash_all"><option value="0"${s.crash_all === '0' ? ' selected' : ''}>Off</option><option value="1"${s.crash_all === '1' ? ' selected' : ''}>On</option></select>
       message <input name="crash_message" value="${esc(s.crash_message)}"></div>
@@ -431,12 +437,12 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/settings' && req.method === 'POST') {
       if (!isAuthed(req)) return sendJson(res, 401, { error: 'login required' });
       const f = parseFields(req, await readBody(req));
-      for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message']) {
+      for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message', 'expired_link']) {
         if (f[k] !== undefined) await setSetting(k, f[k]);
       }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
-    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.0.0', db: dbKind, ok: true });
+    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.1.0', db: dbKind, ok: true });
     res.writeHead(404, { 'Content-Type': 'application/json; charset=UTF-8' });
     res.end(JSON.stringify({ status: false, reason: 'Not found' }));
   } catch (e) {
