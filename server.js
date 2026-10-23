@@ -321,7 +321,11 @@ async function dashboardPage() {
     const devText = maxDev === 0 ? devices.length + ' / Unlimited' : devices.length + ' / ' + maxDev;
     const devList = devices.length ? '<br><span class="small">' + devices.map(esc).join('<br>') + '</span>' : '';
     rows.push(`<tr><td>${k.id}</td><td><b>${esc(k.user_key)}</b><br><span class="small">${esc(k.label)}</span></td>
-    <td>${esc(k.expired_date)}</td><td>${devText}${devList}</td>
+    <td>${esc(k.expired_date)}<br>
+      <form method="post" action="/api/keys/${k.id}/action" style="display:inline">
+        <input type="hidden" name="act" value="set_expiry">
+        <input type="date" name="expiry_date" value="${esc(String(k.expired_date).slice(0, 10))}" style="width:135px">
+        <button class="gray">Set</button></form></td><td>${devText}${devList}</td>
     <td class="${k.status === 'active' ? 'ok' : 'bad'}">${esc(k.status)}</td>
     <td>${esc(k.seller_name)} / ${esc(k.registrator)}</td>
     <td>
@@ -431,6 +435,10 @@ const server = http.createServer(async (req, res) => {
       else if (f.act === 'ban') await dbRun("UPDATE keys SET status='banned' WHERE id=?", id);
       else if (f.act === 'unban') await dbRun("UPDATE keys SET status='active' WHERE id=?", id);
       else if (f.act === 'crash') await dbRun("UPDATE keys SET status='crash' WHERE id=?", id);
+      else if (f.act === 'set_expiry') {
+        const d = String(f.expiry_date || '').trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(d)) await dbRun('UPDATE keys SET expired_date=? WHERE id=?', d + ' 23:59:59', id);
+      }
       else if (f.act === 'delete') { await dbRun('DELETE FROM key_devices WHERE key_id=?', id); await dbRun('DELETE FROM keys WHERE id=?', id); }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
@@ -442,7 +450,7 @@ const server = http.createServer(async (req, res) => {
       }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
-    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.1.0', db: dbKind, ok: true });
+    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.1.1', db: dbKind, ok: true });
     res.writeHead(404, { 'Content-Type': 'application/json; charset=UTF-8' });
     res.end(JSON.stringify({ status: false, reason: 'Not found' }));
   } catch (e) {
