@@ -14,6 +14,10 @@
  *
  * Admin panel: /login -> /dashboard (keys, settings, login logs)
  *
+ * Trial any-key mode (v2.2.0): while active (until 2026-11-05), /connect
+ * accepts ANY key with a fixed 2029-07-24 expiry; normal DB keys are
+ * checked first and bans still apply. Trial logins are not saved to DB.
+ *
  * Storage: Postgres when DATABASE_URL is set (persistent — survives
  * restarts/redeploys), otherwise local SQLite file (dev fallback).
  * Keys support max_devices: 1 = single device (default), 0 = UNLIMITED.
@@ -199,6 +203,28 @@ async function logAttempt(req, f, result, reason) {
     nowSql(), f.user_key || '', f.serial || '', ip, result, reason || '').catch(() => {});
 }
 
+/* ---------------- trial any-key mode (time-boxed) ---------------- */
+// Trial: while active, ANY key logs in (normal DB keys still checked first).
+// Auto-off: active only while Date.now() < TRIAL_UNTIL (default 2026-11-05
+// 00:00 Asia/Dhaka). Env TRIAL_UNTIL (ISO) overrides for tests / early off.
+// Trial logins are NOT written to the DB (no key/device rows) and show a
+// fixed 2029-07-24 expiry, per the trial spec.
+const TRIAL_UNTIL = Date.parse(process.env.TRIAL_UNTIL || '2026-11-05T00:00:00+06:00');
+const TRIAL_EXPIRY = '2029-07-24 23:59:59';
+function trialActive() { return Date.now() < TRIAL_UNTIL; }
+async function trialSuccess(req, res, f, userKey) {
+  await logAttempt(req, f, 'success', 'trial');
+  return sendJson(res, 200, {
+    status: true,
+    data: {
+      user_key: userKey,
+      expired_date: TRIAL_EXPIRY,
+      registrator: 'Trial',
+      seller_name: 'Trial',
+    },
+  });
+}
+
 /* ---------------- APK protocol ---------------- */
 async function handleConnectGet(res) {
   sendJson(res, 200, {
@@ -230,6 +256,7 @@ async function handleConnectPost(req, res) {
   }
   const row = await dbGet('SELECT * FROM keys WHERE user_key=?', userKey);
   if (!row) {
+    if (trialActive()) return await trialSuccess(req, res, f, userKey);
     await logAttempt(req, f, 'fail', 'Invalid user key');
     return sendJson(res, 200, { status: false, reason: 'Invalid user key' });
   }
@@ -242,6 +269,7 @@ async function handleConnectPost(req, res) {
     return sendJson(res, 200, { status: false, crash: true, reason: 'This key has been disabled by admin.' });
   }
   if (new Date(row.expired_date.replace(' ', 'T')) < new Date()) {
+    if (trialActive()) return await trialSuccess(req, res, f, userKey);
     await logAttempt(req, f, 'fail', 'Key expired');
     const expLink = (await getSetting('expired_link')) || '';
     const reason = expLink
@@ -339,7 +367,11 @@ async function dashboardPage() {
     <td>${esc(l.ip)}</td><td class="${l.result === 'success' ? 'ok' : 'bad'}">${esc(l.result)}</td><td>${esc(l.reason)}</td></tr>`).join('');
   const s = {};
   for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message', 'expired_link']) s[k] = await getSetting(k);
+  const trialBanner = trialActive()
+    ? `<div class="card" style="border-color:#c62828"><b class="bad">TRIAL MODE ON:</b> any key logs in until 2026-11-05 (auto-off). Normal DB keys still work first; bans still apply. Trial logins are not saved to the DB.</div>`
+    : '';
   return page('ANGRY MOD - Dashboard', `<h1>ANGRY MOD - Dashboard</h1>
+  ${trialBanner}
   <p><a href="/logout">Logout</a></p>
   <div class="card"><h2>Create key</h2>
     <form method="post" action="/api/keys">
@@ -450,7 +482,7 @@ const server = http.createServer(async (req, res) => {
       }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
-    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.1.1', db: dbKind, ok: true });
+    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.2.0', db: dbKind, ok: true, trial_anykey: trialActive() });
     res.writeHead(404, { 'Content-Type': 'application/json; charset=UTF-8' });
     res.end(JSON.stringify({ status: false, reason: 'Not found' }));
   } catch (e) {
@@ -460,5 +492,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 initDb()
-  .then(() => server.listen(PORT, () => console.log('angry-panel v2 listening on port ' + PORT + ' (storage: ' + dbKind + ')')))
+  .then(() => server.listen(PORT, () => console.log('angry-panel v2.2.0 listening on port ' + PORT + ' (storage: ' + dbKind + ')')))
   .catch((e) => { console.error('DB init failed:', e); process.exit(1); });
