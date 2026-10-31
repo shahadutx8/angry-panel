@@ -19,6 +19,10 @@
  * checked first and bans still apply. Trial logins are not saved to DB.
  * v2.2.1: dashboard Settings toggle "Unlimited devices" — when On,
  * per-key device limits are ignored for all keys (default Off).
+ * v2.2.2: trial any-key mode gains a manual Settings toggle
+ * "Trial any-key mode" (default Off). Trial works only while the toggle
+ * is On AND before 2026-11-05; the toggle lets the admin end the trial
+ * early without a redeploy.
  *
  * Storage: Postgres when DATABASE_URL is set (persistent — survives
  * restarts/redeploys), otherwise local SQLite file (dev fallback).
@@ -132,6 +136,7 @@ async function initDb() {
   if (!(await getSetting('crash_all'))) await setSetting('crash_all', '0');
   if (!(await getSetting('crash_message'))) await setSetting('crash_message', 'Server is under maintenance');
   if (!(await getSetting('unlimited_devices'))) await setSetting('unlimited_devices', '0');
+  if (!(await getSetting('trial_anykey'))) await setSetting('trial_anykey', '0');
   if (!(await getSetting('expired_link'))) await setSetting('expired_link', '');
 }
 
@@ -214,7 +219,7 @@ async function logAttempt(req, f, result, reason) {
 // fixed 2029-07-24 expiry, per the trial spec.
 const TRIAL_UNTIL = Date.parse(process.env.TRIAL_UNTIL || '2026-11-05T00:00:00+06:00');
 const TRIAL_EXPIRY = '2029-07-24 23:59:59';
-function trialActive() { return Date.now() < TRIAL_UNTIL; }
+async function trialActive() { return (await getSetting('trial_anykey')) === '1' && Date.now() < TRIAL_UNTIL; }
 async function trialSuccess(req, res, f, userKey) {
   await logAttempt(req, f, 'success', 'trial');
   return sendJson(res, 200, {
@@ -259,7 +264,7 @@ async function handleConnectPost(req, res) {
   }
   const row = await dbGet('SELECT * FROM keys WHERE user_key=?', userKey);
   if (!row) {
-    if (trialActive()) return await trialSuccess(req, res, f, userKey);
+    if (await trialActive()) return await trialSuccess(req, res, f, userKey);
     await logAttempt(req, f, 'fail', 'Invalid user key');
     return sendJson(res, 200, { status: false, reason: 'Invalid user key' });
   }
@@ -272,7 +277,7 @@ async function handleConnectPost(req, res) {
     return sendJson(res, 200, { status: false, crash: true, reason: 'This key has been disabled by admin.' });
   }
   if (new Date(row.expired_date.replace(' ', 'T')) < new Date()) {
-    if (trialActive()) return await trialSuccess(req, res, f, userKey);
+    if (await trialActive()) return await trialSuccess(req, res, f, userKey);
     await logAttempt(req, f, 'fail', 'Key expired');
     const expLink = (await getSetting('expired_link')) || '';
     const reason = expLink
@@ -370,11 +375,11 @@ async function dashboardPage() {
   const logRows = logs.map((l) => `<tr><td>${esc(l.ts)}</td><td>${esc(l.user_key)}</td><td>${esc(l.serial)}</td>
     <td>${esc(l.ip)}</td><td class="${l.result === 'success' ? 'ok' : 'bad'}">${esc(l.result)}</td><td>${esc(l.reason)}</td></tr>`).join('');
   const s = {};
-  for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message', 'expired_link', 'unlimited_devices']) s[k] = await getSetting(k);
+  for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message', 'expired_link', 'unlimited_devices', 'trial_anykey']) s[k] = await getSetting(k);
   const udBanner = s.unlimited_devices === '1'
     ? `<div class="card" style="border-color:#c62828"><b class="bad">UNLIMITED DEVICES ON:</b> device limits are ignored for all keys. Turn it off in Settings when done.</div>`
     : '';
-  const trialBanner = trialActive()
+  const trialBanner = (await trialActive())
     ? `<div class="card" style="border-color:#c62828"><b class="bad">TRIAL MODE ON:</b> any key logs in until 2026-11-05 (auto-off). Normal DB keys still work first; bans still apply. Trial logins are not saved to the DB.</div>`
     : '';
   return page('ANGRY MOD - Dashboard', `<h1>ANGRY MOD - Dashboard</h1>
@@ -405,6 +410,8 @@ async function dashboardPage() {
       message <input name="crash_message" value="${esc(s.crash_message)}"></div>
       <div>Unlimited devices (all keys) <select name="unlimited_devices"><option value="0"${s.unlimited_devices === '0' ? ' selected' : ''}>Off</option><option value="1"${s.unlimited_devices === '1' ? ' selected' : ''}>On</option></select>
       <span class="small">When On, device limits are ignored for every key. Turn off to restore per-key limits.</span></div>
+      <div>Trial any-key mode <select name="trial_anykey"><option value="0"${s.trial_anykey === '0' ? ' selected' : ''}>Off</option><option value="1"${s.trial_anykey === '1' ? ' selected' : ''}>On</option></select>
+      <span class="small">When On, any key logs in (until 2026-11-05 auto-off). Turn off to end the trial immediately.</span></div>
       <button>Save settings</button>
     </form>
     <p class="small">APK endpoints: POST /connect &nbsp; GET /update.php &nbsp; GET /apkhash.php &nbsp; Storage: ${dbKind}</p></div>
@@ -487,12 +494,12 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/settings' && req.method === 'POST') {
       if (!isAuthed(req)) return sendJson(res, 401, { error: 'login required' });
       const f = parseFields(req, await readBody(req));
-      for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message', 'expired_link', 'unlimited_devices']) {
+      for (const k of ['latest_version', 'latest_version_code', 'update_url', 'update_message', 'apk_md5', 'crash_all', 'crash_message', 'expired_link', 'unlimited_devices', 'trial_anykey']) {
         if (f[k] !== undefined) await setSetting(k, f[k]);
       }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
-    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.2.1', db: dbKind, ok: true, trial_anykey: trialActive(), unlimited_devices: (await getSetting('unlimited_devices')) === '1' });
+    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.2.2', db: dbKind, ok: true, trial_anykey: await trialActive(), unlimited_devices: (await getSetting('unlimited_devices')) === '1' });
     res.writeHead(404, { 'Content-Type': 'application/json; charset=UTF-8' });
     res.end(JSON.stringify({ status: false, reason: 'Not found' }));
   } catch (e) {
