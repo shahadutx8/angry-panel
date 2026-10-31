@@ -23,6 +23,9 @@
  * "Trial any-key mode" (default Off). Trial works only while the toggle
  * is On AND before 2026-11-05; the toggle lets the admin end the trial
  * early without a redeploy.
+ * v2.2.3: dashboard "Delete expired keys (N)" button — deletes every
+ * key whose expiry has passed (plus its device rows); logs are kept.
+ * The button shows the live count before deleting.
  *
  * Storage: Postgres when DATABASE_URL is set (persistent — survives
  * restarts/redeploys), otherwise local SQLite file (dev fallback).
@@ -351,6 +354,10 @@ function loginPage(err) {
 async function dashboardPage() {
   const keys = await dbAll('SELECT * FROM keys ORDER BY id DESC');
   const logs = await dbAll('SELECT * FROM logs ORDER BY id DESC LIMIT 50');
+  const expiredCount = keys.filter((k) => new Date(String(k.expired_date).replace(' ', 'T')) < new Date()).length;
+  const expiredForm = expiredCount > 0
+    ? `<form method="post" action="/api/keys/delete-expired" onsubmit="return confirm('Delete ${expiredCount} expired keys? This cannot be undone.')" style="display:inline"><button class="gray">Delete expired keys (${expiredCount})</button></form>`
+    : '<span class="small">No expired keys.</span>';
   const rows = [];
   for (const k of keys) {
     const devices = await listDevices(k.id);
@@ -396,7 +403,7 @@ async function dashboardPage() {
       <input name="registrator" placeholder="Registrator" value="Admin">
       <button>Create</button>
     </form></div>
-  <div class="card"><h2>Keys (${keys.length})</h2><table>
+  <div class="card"><h2>Keys (${keys.length})</h2><p>${expiredForm}</p><table>
     <tr><th>#</th><th>Key</th><th>Expiry</th><th>Devices</th><th>Status</th><th>Seller/By</th><th>Action</th></tr>${rows.join('')}</table></div>
   <div class="card"><h2>Settings</h2>
     <form method="post" action="/api/settings">
@@ -476,6 +483,18 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
     const m = p.match(/^\/api\/keys\/(\d+)\/action$/);
+    if (p === '/api/keys/delete-expired' && req.method === 'POST') {
+      if (!isAuthed(req)) return sendJson(res, 401, { error: 'login required' });
+      const all = await dbAll('SELECT id, expired_date FROM keys');
+      const now = new Date();
+      for (const k of all) {
+        if (new Date(String(k.expired_date).replace(' ', 'T')) < now) {
+          await dbRun('DELETE FROM key_devices WHERE key_id=?', k.id);
+          await dbRun('DELETE FROM keys WHERE id=?', k.id);
+        }
+      }
+      res.writeHead(302, { Location: '/dashboard' }); return res.end();
+    }
     if (m && req.method === 'POST') {
       if (!isAuthed(req)) return sendJson(res, 401, { error: 'login required' });
       const f = parseFields(req, await readBody(req));
@@ -499,7 +518,7 @@ const server = http.createServer(async (req, res) => {
       }
       res.writeHead(302, { Location: '/dashboard' }); return res.end();
     }
-    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.2.2', db: dbKind, ok: true, trial_anykey: await trialActive(), unlimited_devices: (await getSetting('unlimited_devices')) === '1' });
+    if (p === '/healthz') return sendJson(res, 200, { name: 'angry-panel', version: '2.2.3', db: dbKind, ok: true, trial_anykey: await trialActive(), unlimited_devices: (await getSetting('unlimited_devices')) === '1' });
     res.writeHead(404, { 'Content-Type': 'application/json; charset=UTF-8' });
     res.end(JSON.stringify({ status: false, reason: 'Not found' }));
   } catch (e) {
